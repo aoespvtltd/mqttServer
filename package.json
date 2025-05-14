@@ -2,7 +2,7 @@
   "name": "mqtt",
   "module": "index.js",
   "scripts": {
-    "dev": "nodemon index4.js",
+    "dev": "nodemon index4.js"
   },
   "devDependencies": {
     "@types/bun": "latest"
