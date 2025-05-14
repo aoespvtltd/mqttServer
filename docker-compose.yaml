@@ -1,0 +1,8 @@
+version: "3"
+services:
+  app1:
+    build: .
+    environment:
+      - APP_NAME=App1
+    ports:
+      - "7001:7000"
