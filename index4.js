@@ -1,96 +1,152 @@
-const mqtt = require('mqtt');
-const axios = require('axios');
-const express = require('express');
+// const express = require('express');
+// const mqtt = require('mqtt');
+
+import express from 'express';
+import mqtt from 'mqtt';
+import axios from 'axios';
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = 3000;
 
-// MQTT Setup
-const client = mqtt.connect('mqtt://mqtt.eclipseprojects.io');
-const topic = 'JG25001/server';
-const responseTopic = 'JG25001/device';
-const padEaseId = '680b619869560b1945b83dce';
-const machineCode = 'JG25001';
+// MQTT client setup
+const mqttBrokerUrl = 'mqtt://mqtt.eclipseprojects.io'; // Change to your broker
+let mqttTopics = []; // Will be populated from API
+let getAllTopics = [];
 
-let heartbeatTimeout = null;
-let isMachineActive = null; // To prevent repeated PATCH calls
+// Map to store heartbeat timers for each device
+const deviceHeartbeats = new Map();
 
-const setMachineStatus = async (status) => {
-  if (isMachineActive === status) return; // Avoid redundant requests
+const mqttClient = mqtt.connect(mqttBrokerUrl);
 
-  isMachineActive = status;
-  try {
-    await axios.patch(`https://vendingao-api.xyz/api/v1/padEase/name/${machineCode}`, {
-      status: status,
-    });
-    console.log(`Machine status updated to: ${status ? 'active' : 'inactive'}`);
-  } catch (err) {
-    console.error(`Failed to update machine status: ${err.message}`);
-  }
-};
+const sendStockMessage = async (topic) => {
+    try {
+        // Extract device identifier from topic (remove /server suffix)
+        const deviceIdentifier = topic.replace('/server', '');
+        
+        // Find the padEase device in getAllTopics
+        const padEaseDevice = getAllTopics.find(device => 
+            device.type === 'padEase' && 
+            (device.name === deviceIdentifier || device._id === deviceIdentifier)
+        );
 
-const resetHeartbeatTimer = () => {
-  if (heartbeatTimeout) clearTimeout(heartbeatTimeout);
+        if (!padEaseDevice) {
+            console.error(`No padEase device found for identifier: ${deviceIdentifier}`);
+            return;
+        }
 
-  heartbeatTimeout = setTimeout(() => {
-    console.log('Machine inactive (no heartbeat received in 60s).');
-    setMachineStatus(false);
-  }, 60 * 1000); // 1 minute
-};
-
-const sendStockMessage = async () => {
-  try {
-    const response = await axios.get(`https://vendingao-api.xyz/api/v1/pad/active/${padEaseId}`);
-    const pads = response.data?.data || [];
-
-    const stockMessage = `*padEase,${machineCode},` +
-      pads.map(pad => `S${pad.padNumber}:${pad.stock}`).join(',') + 'y#';
-
-    console.log(`Formatted stock message: ${stockMessage}`);
-    client.publish(responseTopic, stockMessage);
-  } catch (error) {
-    console.error('Error fetching pad stock:', error.message);
-  }
-};
-
-client.on('connect', () => {
-  console.log('Connected to MQTT broker.');
-
-  client.subscribe(topic, (err) => {
-    if (!err) {
-      console.log(`Subscribed to topic: ${topic}`);
-    } else {
-      console.error(`Failed to subscribe: ${err.message}`);
+        const response = await axios.get(`https://vendingao-api.xyz/api/v1/pad/active/${padEaseDevice._id}`);
+        console.log("object") 
+        // Update device status to inactive
+        await axios.patch(`https://vendingao-api.xyz/api/v1/padEase/name/${padEaseDevice.name}`, {
+            status: true
+        });
+        const pads = response.data?.data || [];
+    
+        const stockMessage = `*padEase,${deviceIdentifier},` +
+            pads.map(pad => `S${pad.padNumber}:${pad.stock}`).join(',') + 'y#';
+    
+        console.log(`Formatted stock message: ${stockMessage}`, `${deviceIdentifier}/device`, stockMessage);
+        mqttClient.publish(`${deviceIdentifier}/device`, stockMessage);
+    } catch (error) {
+        console.error('Error fetching pad stock:', error.message);
     }
-  });
+};
+
+// Function to handle device heartbeat
+const handleDeviceHeartbeat = (deviceId) => {
+    // Clear existing timeout if any
+    if (deviceHeartbeats.has(deviceId)) {
+        clearTimeout(deviceHeartbeats.get(deviceId));
+    }
+
+    // Set new timeout
+    const timeout = setTimeout(async () => {
+        try {
+            // Update device status to inactive
+            await axios.patch(`https://vendingao-api.xyz/api/v1/padEase/name/${deviceId}`, {
+                status: false
+            });
+            console.log(`Device ${deviceId} marked as inactive due to no heartbeat`);
+            deviceHeartbeats.delete(deviceId);
+        } catch (error) {
+            console.error(`Error updating status for device ${deviceId}:`, error.message);
+        }
+    }, 5 * 60 * 1000); // 5 minutes
+
+    deviceHeartbeats.set(deviceId, timeout);
+};
+
+// Function to fetch topics from API
+async function fetchTopicsFromAPI() {
+    try {
+        const response = await axios.get('https://vendingao-api.xyz/api/v1/vending-machines/getOverall');
+        if (response.data && response.data.success && Array.isArray(response.data.data)) {
+            getAllTopics = response.data.data;
+            // Filter padEase devices and format their topics
+            mqttTopics = response.data.data
+                // .filter(device => device.type === 'padEase')
+                .map(device => `${device.name || device._id}/server`);
+            
+            console.log('Fetched topics from API:', mqttTopics);
+            
+            // Subscribe to the fetched topics
+            if (mqttClient.connected) {
+                mqttClient.subscribe(mqttTopics, (err) => {
+                    if (err) {
+                        console.error('Subscription error:', err);
+                    } else {
+                        console.log(`Subscribed to topics: ${mqttTopics.join(', ')}`);
+                    }
+                });
+            }
+        } else {
+            console.error('Invalid response format from API');
+        }
+    } catch (error) {
+        console.error('Error fetching topics from API:', error.message);
+    }
+}
+
+// When connected, fetch topics and subscribe
+mqttClient.on('connect', () => {
+    console.log('Connected to MQTT broker');
+    fetchTopicsFromAPI();
 });
 
-client.on('message', async (receivedTopic, message) => {
-  const messageStr = message.toString().trim();
-  console.log(`Received message from ${receivedTopic}: ${messageStr}`);
+// Handle incoming messages
+mqttClient.on('message', (topic, message) => {
+    const messageStr = message.toString();
+    console.log(`Received message on topic "${topic}": ${messageStr}`);
 
-  if (messageStr.includes('HB')) {
-    console.log('Heartbeat received.');
-    setMachineStatus(true);
-    await sendStockMessage();
-    resetHeartbeatTimer();
-    return;
-  }
+    // Check if this is a padEase topic and contains heartbeat
+    if (topic.endsWith('/server') && messageStr.includes('HB')) {
+        // Extract device name from topic (remove /server suffix)
+        const deviceName = topic.replace('/server', '');
+        
+        // Update device status to active
+        axios.patch(`https://vendingao-api.xyz/api/v1/padEase/name/${deviceName}`, {
+            status: true
+        }).catch(error => {
+            console.error(`Error updating status for device ${deviceName}:`, error.message);
+        });
 
-  if (messageStr.includes('SR')) {
-    console.log('Stock request received.');
-    await sendStockMessage();
-    return;
-  }
-
-  console.log('Unrecognized message type.');
+        // Handle heartbeat
+        handleDeviceHeartbeat(deviceName);
+    }
+    
+    // Handle stock request messages
+    if (topic.startsWith('J') && messageStr.includes('SR')) {
+        const deviceTopic = `${topic}/device`;
+        sendStockMessage(topic);
+    }
 });
 
-// HTTP route to verify the app is running
+// Express endpoint for health check
 app.get('/', (req, res) => {
-  res.send('MQTT stock listener is running.');
+    res.send('MQTT Subscriber is running.');
 });
 
-app.listen(port, () => {
-  console.log(`Server is listening on port ${port}`);
+// Start Express server
+app.listen(PORT, () => {
+    console.log(`Express server listening at http://localhost:${PORT}`);
 });
